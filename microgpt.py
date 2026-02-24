@@ -1,40 +1,43 @@
 """
-The most atomic way to train and run inference for a GPT in pure, dependency-free Python.
-This file is the complete algorithm.
-Everything else is just efficiency.
+La manière la plus atomique d'entraîner et d'effectuer des inférences pour un GPT
+en Python pur, sans dépendances externes.
+Ce fichier contient l'algorithme complet.
+Tout le reste n'est que question d'efficacité.
 
 @karpathy
 """
 
-import os       # os.path.exists
-import math     # math.log, math.exp
-import random   # random.seed, random.choices, random.gauss, random.shuffle
-random.seed(42) # Let there be order among chaos
+import os       # pour os.path.exists si nécessaire
+import math     # pour math.log, math.exp
+import random   # pour random.seed, random.choices, random.gauss, random.shuffle
+random.seed(42) # Pour reproduire les résultats (même "hasard")
 
-# Let there be a Dataset `docs`: list[str] of documents (e.g. a list of names)
-
+# --- Chargement du dataset ---
+# Chaque ligne de 'prenoms.txt' est un document (ici, un prénom)
 with open('prenoms.txt', 'r', encoding='utf-8') as f:
-    docs = [line.strip() for line in f if line.strip()]
+    docs = [line.strip() for line in f if line.strip()]  # on enlève les lignes vides
 
-random.shuffle(docs)
-print(f"num docs: {len(docs)}")
+random.shuffle(docs) # Mélange aléatoire pour éviter un ordre biaisé
+print(f"num docs: {len(docs)}")  # nombre de prénoms dans le dataset
 
-# Let there be a Tokenizer to translate strings to sequences of integers ("tokens") and back
-uchars = sorted(set(''.join(docs))) # unique characters in the dataset become token ids 0..n-1
-BOS = len(uchars) # token id for a special Beginning of Sequence (BOS) token
-vocab_size = len(uchars) + 1 # total number of unique tokens, +1 is for BOS
+# --- Tokenisation simple (caractère par caractère) ---
+uchars = sorted(set(''.join(docs)))  # caractères uniques du dataset → tokens
+BOS = len(uchars)                     # token spécial "Beginning Of Sequence"
+vocab_size = len(uchars) + 1          # taille du vocabulaire incluant BOS
 print(f"vocab size: {vocab_size}")
+print(f"vocab uchars: {uchars}")
 
-# Let there be Autograd to recursively apply the chain rule through a computation graph
+# --- Autograd simple pour le calcul des gradients ---
 class Value:
-    __slots__ = ('data', 'grad', '_children', '_local_grads') # Python optimization for memory usage
+    __slots__ = ('data', 'grad', '_children', '_local_grads') # optimisation mémoire
 
     def __init__(self, data, children=(), local_grads=()):
-        self.data = data                # scalar value of this node calculated during forward pass
-        self.grad = 0                   # derivative of the loss w.r.t. this node, calculated in backward pass
-        self._children = children       # children of this node in the computation graph
-        self._local_grads = local_grads # local derivative of this node w.r.t. its children
+        self.data = data                # valeur scalaire calculée au forward
+        self.grad = 0                   # gradient calculé au backward
+        self._children = children       # enfants dans le graphe de calcul
+        self._local_grads = local_grads # dérivées locales par rapport aux enfants
 
+    # opérations de base (+, *, -, /, puissance, log, exp, relu)
     def __add__(self, other):
         other = other if isinstance(other, Value) else Value(other)
         return Value(self.data + other.data, (self, other), (1, 1))
@@ -55,6 +58,7 @@ class Value:
     def __truediv__(self, other): return self * other**-1
     def __rtruediv__(self, other): return other * self**-1
 
+    # backward automatique via parcours topologique
     def backward(self):
         topo = []
         visited = set()
@@ -70,14 +74,24 @@ class Value:
             for child, local_grad in zip(v._children, v._local_grads):
                 child.grad += local_grad * v.grad
 
-# Initialize the parameters, to store the knowledge of the model
-n_layer = 1     # depth of the transformer neural network (number of layers)
-n_embd = 16     # width of the network (embedding dimension)
-block_size = 16 # maximum context length of the attention window (note: the longest name is 15 characters)
-n_head = 4      # number of attention heads
-head_dim = n_embd // n_head # derived dimension of each head
+# --- Initialisation des paramètres du modèle ---
+n_layer = 1     # profondeur du réseau transformer
+n_embd = 16     # dimension des embeddings
+block_size = 16 # longueur maximale du contexte (ici max 15 caractères)
+n_head = 4      # nombre de têtes d'attention
+head_dim = n_embd // n_head # dimension de chaque tête
+
+# Fonction utilitaire pour initialiser des matrices de paramètres avec distribution gaussienne
 matrix = lambda nout, nin, std=0.08: [[Value(random.gauss(0, std)) for _ in range(nin)] for _ in range(nout)]
-state_dict = {'wte': matrix(vocab_size, n_embd), 'wpe': matrix(block_size, n_embd), 'lm_head': matrix(vocab_size, n_embd)}
+
+# Dictionnaire contenant tous les paramètres du modèle
+state_dict = {
+    'wte': matrix(vocab_size, n_embd),  # embedding des tokens
+    'wpe': matrix(block_size, n_embd),  # embedding des positions
+    'lm_head': matrix(vocab_size, n_embd) # tête de sortie
+}
+
+# Ajout des paramètres des couches transformer
 for i in range(n_layer):
     state_dict[f'layer{i}.attn_wq'] = matrix(n_embd, n_embd)
     state_dict[f'layer{i}.attn_wk'] = matrix(n_embd, n_embd)
@@ -85,33 +99,38 @@ for i in range(n_layer):
     state_dict[f'layer{i}.attn_wo'] = matrix(n_embd, n_embd)
     state_dict[f'layer{i}.mlp_fc1'] = matrix(4 * n_embd, n_embd)
     state_dict[f'layer{i}.mlp_fc2'] = matrix(n_embd, 4 * n_embd)
-params = [p for mat in state_dict.values() for row in mat for p in row] # flatten params into a single list[Value]
+
+# Flatten des paramètres pour Adam
+params = [p for mat in state_dict.values() for row in mat for p in row]
 print(f"num params: {len(params)}")
 
-# Define the model architecture: a function mapping tokens and parameters to logits over what comes next
-# Follow GPT-2, blessed among the GPTs, with minor differences: layernorm -> rmsnorm, no biases, GeLU -> ReLU
+# --- Définition de l'architecture GPT ---
 def linear(x, w):
+    # produit matriciel simple : w * x
     return [sum(wi * xi for wi, xi in zip(wo, x)) for wo in w]
 
 def softmax(logits):
+    # conversion logits → probabilités
     max_val = max(val.data for val in logits)
-    exps = [(val - max_val).exp() for val in logits]
+    exps = [(val - max_val).exp() for val in logits] # stabilité numérique
     total = sum(exps)
     return [e / total for e in exps]
 
 def rmsnorm(x):
+    # normalisation RMS (remplace layernorm pour simplicité)
     ms = sum(xi * xi for xi in x) / len(x)
     scale = (ms + 1e-5) ** -0.5
     return [xi * scale for xi in x]
 
 def gpt(token_id, pos_id, keys, values):
-    tok_emb = state_dict['wte'][token_id] # token embedding
-    pos_emb = state_dict['wpe'][pos_id] # position embedding
-    x = [t + p for t, p in zip(tok_emb, pos_emb)] # joint token and position embedding
-    x = rmsnorm(x) # note: not redundant due to backward pass via the residual connection
+    # Forward d'un token dans le modèle GPT
+    tok_emb = state_dict['wte'][token_id] # embedding du token
+    pos_emb = state_dict['wpe'][pos_id]   # embedding de position
+    x = [t + p for t, p in zip(tok_emb, pos_emb)] # sommation token + position
+    x = rmsnorm(x)
 
     for li in range(n_layer):
-        # 1) Multi-head Attention block
+        # --- Bloc Multi-head Attention ---
         x_residual = x
         x = rmsnorm(x)
         q = linear(x, state_dict[f'layer{li}.attn_wq'])
@@ -131,7 +150,8 @@ def gpt(token_id, pos_id, keys, values):
             x_attn.extend(head_out)
         x = linear(x_attn, state_dict[f'layer{li}.attn_wo'])
         x = [a + b for a, b in zip(x, x_residual)]
-        # 2) MLP block
+
+        # --- Bloc MLP ---
         x_residual = x
         x = rmsnorm(x)
         x = linear(x, state_dict[f'layer{li}.mlp_fc1'])
@@ -142,21 +162,19 @@ def gpt(token_id, pos_id, keys, values):
     logits = linear(x, state_dict['lm_head'])
     return logits
 
-# Let there be Adam, the blessed optimizer and its buffers
+# --- Adam Optimizer ---
 learning_rate, beta1, beta2, eps_adam = 0.01, 0.85, 0.99, 1e-8
-m = [0.0] * len(params) # first moment buffer
-v = [0.0] * len(params) # second moment buffer
+m = [0.0] * len(params) # premier moment
+v = [0.0] * len(params) # second moment
 
-# Repeat in sequence
-num_steps = 1000 # number of training steps
+# --- Boucle d'entraînement ---
+num_steps = 1000
 for step in range(num_steps):
-
-    # Take single document, tokenize it, surround it with BOS special token on both sides
-    doc = docs[step % len(docs)]
-    tokens = [BOS] + [uchars.index(ch) for ch in doc] + [BOS]
+    doc = docs[step % len(docs)]  # sélection cyclique d'un document
+    tokens = [BOS] + [uchars.index(ch) for ch in doc] + [BOS]  # tokenisation + BOS
     n = min(block_size, len(tokens) - 1)
 
-    # Forward the token sequence through the model, building up the computation graph all the way to the loss
+    # Forward pass + calcul du loss
     keys, values = [[] for _ in range(n_layer)], [[] for _ in range(n_layer)]
     losses = []
     for pos_id in range(n):
@@ -165,13 +183,13 @@ for step in range(num_steps):
         probs = softmax(logits)
         loss_t = -probs[target_id].log()
         losses.append(loss_t)
-    loss = (1 / n) * sum(losses) # final average loss over the document sequence. May yours be low.
+    loss = (1 / n) * sum(losses) # loss moyen sur la séquence
 
-    # Backward the loss, calculating the gradients with respect to all model parameters
+    # Backward pass
     loss.backward()
 
-    # Adam optimizer update: update the model parameters based on the corresponding gradients
-    lr_t = learning_rate * (1 - step / num_steps) # linear learning rate decay
+    # Adam update
+    lr_t = learning_rate * (1 - step / num_steps) # décroissance linéaire du LR
     for i, p in enumerate(params):
         m[i] = beta1 * m[i] + (1 - beta1) * p.grad
         v[i] = beta2 * v[i] + (1 - beta2) * p.grad ** 2
@@ -182,9 +200,9 @@ for step in range(num_steps):
 
     print(f"step {step+1:4d} / {num_steps:4d} | loss {loss.data:.4f}", end='\r')
 
-# Inference: may the model babble back to us
-temperature = 0.5 # in (0, 1], control the "creativity" of generated text, low to high
-print("\n--- inference (new, hallucinated names) ---")
+# --- Phase d'inférence / génération de prénoms ---
+temperature = 0.5 # contrôle la créativité
+print("\n--- inference (noms halluciné) ---")
 for sample_idx in range(20):
     keys, values = [[] for _ in range(n_layer)], [[] for _ in range(n_layer)]
     token_id = BOS
@@ -198,21 +216,9 @@ for sample_idx in range(20):
         sample.append(uchars[token_id])
     print(f"sample {sample_idx+1:2d}: {''.join(sample)}")
 
-
-
-
-
-
-
-
-
-
-
-
-# --- phase génération ---
-temperature = 0.5  # contrôle la créativité (0.1 = conservatif, 1 = créatif)
-num_samples = 10   # nombre de prénoms à générer
-
+# --- Génération finale de prénoms ---
+temperature = 0.5  # créativité
+num_samples = 10   # nombre de prénoms générés
 for sample_idx in range(num_samples):
     keys, values = [[] for _ in range(n_layer)], [[] for _ in range(n_layer)]
     token_id = BOS
