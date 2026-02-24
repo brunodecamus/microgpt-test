@@ -12,11 +12,10 @@ import random   # random.seed, random.choices, random.gauss, random.shuffle
 random.seed(42) # Let there be order among chaos
 
 # Let there be a Dataset `docs`: list[str] of documents (e.g. a list of names)
-if not os.path.exists('input.txt'):
-    import urllib.request
-    names_url = 'https://raw.githubusercontent.com/karpathy/makemore/988aa59/names.txt'
-    urllib.request.urlretrieve(names_url, 'input.txt')
-docs = [line.strip() for line in open('input.txt') if line.strip()]
+
+with open('prenoms.txt', 'r', encoding='utf-8') as f:
+    docs = [line.strip() for line in f if line.strip()]
+
 random.shuffle(docs)
 print(f"num docs: {len(docs)}")
 
@@ -198,3 +197,31 @@ for sample_idx in range(20):
             break
         sample.append(uchars[token_id])
     print(f"sample {sample_idx+1:2d}: {''.join(sample)}")
+
+
+
+
+
+
+
+
+
+
+
+
+# --- phase génération ---
+temperature = 0.5  # contrôle la créativité (0.1 = conservatif, 1 = créatif)
+num_samples = 10   # nombre de prénoms à générer
+
+for sample_idx in range(num_samples):
+    keys, values = [[] for _ in range(n_layer)], [[] for _ in range(n_layer)]
+    token_id = BOS
+    sample = []
+    for pos_id in range(block_size):
+        logits = gpt(token_id, pos_id, keys, values)
+        probs = softmax([l / temperature for l in logits])
+        token_id = random.choices(range(vocab_size), weights=[p.data for p in probs])[0]
+        if token_id == BOS:
+            break
+        sample.append(uchars[token_id])
+    print(f"prenom {sample_idx+1:2d}: {''.join(sample)}")
